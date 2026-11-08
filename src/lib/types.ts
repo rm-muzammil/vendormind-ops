@@ -112,6 +112,16 @@ export interface AppEvent {
   message: string;
 }
 
+export interface QuoteOffer {
+  round: number;
+  by: 'vendor' | 'agent';
+  unitPrice?: number;
+  leadDays?: number;
+  message: string;
+  llm: boolean;
+  ts: string;
+}
+
 export interface Rfq {
   id: string;
   token: string;
@@ -120,7 +130,9 @@ export interface Rfq {
   vendorId: string;
   vendorName: string;
   vendorEmail: string;
-  status: 'sent' | 'quoted' | 'simulated';
+  status: 'sent' | 'negotiating' | 'quoted' | 'simulated';
+  round: number;
+  offers: QuoteOffer[];
   quote?: { unitPrice: number; leadDays: number; notes?: string; submittedAt: string };
   deadline: string;
   createdAt: string;
@@ -134,6 +146,9 @@ export interface Trace {
   ms: number;
   ok: boolean;
   tokens?: number;
+  /** tamper-evident chain: hash = sha256(prevHash + canonical record) */
+  prevHash: string;
+  hash: string;
 }
 
 export interface Settings {

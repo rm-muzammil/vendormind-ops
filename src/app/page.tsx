@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
-import { AlertTriangle, Bot, CheckCircle2, Circle, Clock, Loader2, Mail, Package, Play, ShieldCheck, Sparkles, XCircle, Zap } from 'lucide-react';
+import { AlertTriangle, Bot, CheckCircle2, Circle, Clock, Handshake, Link2, Loader2, Mail, Package, Play, ShieldCheck, Sparkles, XCircle, Zap } from 'lucide-react';
 import type { DB, Quote, Rfq, Run, Step } from '@/lib/types';
 
 type AppState = DB & {
@@ -13,6 +13,11 @@ type AppState = DB & {
 interface Health {
   inference: 'online' | 'auth-failed' | 'unreachable' | 'unconfigured';
   model: string;
+}
+interface Verify {
+  ok: boolean;
+  brokenAt: string | null;
+  checked: number;
 }
 type Tab = 'runs' | 'approvals' | 'orders' | 'outbox' | 'audit' | 'activity';
 
@@ -87,16 +92,24 @@ function RunCard({ run, rfqs, origin, busy, onSimulate, onClose }: { run: Run; r
           <div className="text-[11px] text-amber-300">Waiting on vendors. Each vendor answers through its own secure link:</div>
           <ul className="space-y-1">
             {rfqs.map((q) => (
-              <li key={q.id} className="flex items-center justify-between gap-2 text-xs">
-                <span className="truncate">{q.vendorName}</span>
-                <span className="flex items-center gap-2 shrink-0">
-                  <Pill status={q.status}>{q.status}</Pill>
-                  {q.status === 'sent' ? (
-                    <a href={`${origin}/quote/${q.token}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:underline">open vendor portal ↗</a>
-                  ) : (
-                    <span className="text-slate-400">{q.quote ? `$${q.quote.unitPrice} · ${q.quote.leadDays}d` : ''}</span>
-                  )}
-                </span>
+              <li key={q.id} className="text-xs">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="truncate flex items-center gap-1.5">
+                    {q.vendorName}
+                    {q.status === 'negotiating' && (
+                      <span title="Agent is negotiating a lower price"><Handshake className="w-3 h-3 text-amber-400" /></span>
+                    )}
+                  </span>
+                  <span className="flex items-center gap-2 shrink-0">
+                    <Pill status={q.status}>{q.status}</Pill>
+                    {q.status === 'sent' || q.status === 'negotiating' ? (
+                      <a href={`${origin}/quote/${q.token}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:underline">open vendor portal ↗</a>
+                    ) : (
+                      <span className="text-slate-400">{q.quote ? `$${q.quote.unitPrice} · ${q.quote.leadDays}d` : ''}</span>
+                    )}
+                  </span>
+                </div>
+                {q.status === 'negotiating' && <div className="text-[10px] text-amber-300 mt-0.5">Autonomous negotiation in progress — agent countered an over-budget quote, awaiting the vendor's best and final offer.</div>}
               </li>
             ))}
           </ul>
@@ -137,6 +150,7 @@ function QuoteTable({ quotes, highlight }: { quotes: Quote[]; highlight?: string
 export default function Dashboard() {
   const [state, setState] = useState<AppState | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
+  const [verify, setVerify] = useState<Verify | null>(null);
   const [tab, setTab] = useState<Tab>('runs');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -154,15 +168,20 @@ export default function Dashboard() {
   const refreshHealth = useCallback(async () => {
     try { setHealth(await (await fetch('/api/health')).json()); } catch { setHealth(null); }
   }, []);
+  const refreshVerify = useCallback(async () => {
+    try { setVerify(await (await fetch('/api/audit/verify', { cache: 'no-store' })).json()); } catch { setVerify(null); }
+  }, []);
 
   useEffect(() => {
     setOrigin(window.location.origin);
     refresh();
     refreshHealth();
+    refreshVerify();
     const a = setInterval(refresh, 2000);
     const b = setInterval(refreshHealth, 20000);
-    return () => { clearInterval(a); clearInterval(b); };
-  }, [refresh, refreshHealth]);
+    const c = setInterval(refreshVerify, 15000);
+    return () => { clearInterval(a); clearInterval(b); clearInterval(c); };
+  }, [refresh, refreshHealth, refreshVerify]);
 
   const act = async (key: string, fn: () => Promise<unknown>, goto?: Tab) => {
     setBusy(key);
@@ -416,6 +435,14 @@ export default function Dashboard() {
 
           {tab === 'audit' && (
             <div>
+              <div className={`flex items-center gap-2 text-xs rounded-lg border px-3 py-2 mb-3 ${verify?.ok ? 'bg-emerald-950/30 border-emerald-900 text-emerald-300' : verify ? 'bg-rose-950/30 border-rose-900 text-rose-300' : 'bg-slate-950 border-slate-800 text-slate-400'}`}>
+                <Link2 className="w-3.5 h-3.5 shrink-0" />
+                {verify ? (
+                  verify.ok
+                    ? <span>Decision ledger verified: {verify.checked} hash-chained records, no tampering detected.</span>
+                    : <span>Ledger integrity check FAILED at record {verify.brokenAt} — history may have been altered.</span>
+                ) : <span>Checking decision ledger…</span>}
+              </div>
               <div className="grid grid-cols-3 gap-2 mb-3">
                 {[
                   ['Model calls', String(state.metrics.llmCalls)],

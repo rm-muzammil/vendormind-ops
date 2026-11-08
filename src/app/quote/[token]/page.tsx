@@ -4,14 +4,25 @@ import { useCallback, useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { CheckCircle2, Loader2, Package } from 'lucide-react';
 
+interface Offer {
+  round: number;
+  by: 'vendor' | 'agent';
+  unitPrice?: number;
+  leadDays?: number;
+  message: string;
+  ts: string;
+}
 interface Info {
   vendorName: string;
   item: string;
   qty: number;
   neededBy: string;
   deadline: string;
-  status: 'sent' | 'quoted' | 'simulated';
+  status: 'sent' | 'negotiating' | 'quoted' | 'simulated';
+  round: number;
   open: boolean;
+  counterMessage?: string;
+  offers: Offer[];
   quote?: { unitPrice: number; leadDays: number };
 }
 
@@ -77,7 +88,14 @@ export default function VendorPortal() {
               <div className="text-xs text-slate-400">Needed by {info.neededBy} · window closes {info.deadline.slice(0, 16).replace('T', ' ')} UTC</div>
             </div>
 
-            {info.quote ? (
+            {info.status === 'negotiating' && info.counterMessage && (
+              <div className="bg-amber-950/20 border border-amber-900 rounded-lg p-3 text-xs text-amber-200 space-y-1">
+                <div className="font-semibold text-amber-300">Message from Acme Procurement (round {info.round})</div>
+                <p>{info.counterMessage}</p>
+              </div>
+            )}
+
+            {info.status === 'quoted' && info.quote ? (
               <div className="flex items-start gap-2 text-sm text-emerald-300 bg-emerald-950/30 border border-emerald-900 rounded-lg p-3">
                 <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
                 <span>Quote received: ${info.quote.unitPrice} per unit, {info.quote.leadDays} day lead time. Thank you, the buyer has been notified.</span>
@@ -97,7 +115,7 @@ export default function VendorPortal() {
                 </label>
                 {error && <p className="text-rose-300">{error}</p>}
                 <button disabled={busy || !unitPrice || !leadDays} onClick={submit} className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-sm font-medium py-2 rounded-lg flex items-center justify-center gap-2">
-                  {busy && <Loader2 className="w-4 h-4 animate-spin" />}Submit quote
+                  {busy && <Loader2 className="w-4 h-4 animate-spin" />}{info.status === 'negotiating' ? 'Submit best and final offer' : 'Submit quote'}
                 </button>
                 <p className="text-[11px] text-slate-500">Your quote is private. You cannot see other vendors&apos; prices.</p>
               </div>

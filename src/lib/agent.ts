@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
 import { randomBytes } from 'node:crypto';
 import { APPROVAL_THRESHOLD, CATEGORIES, daysBetween, isoDay } from './catalog';
+import { GENESIS_HASH, nextHash } from './ledger';
 import { log, mutate, snapshot, uid } from './store';
 import type { DB, Email, Order, PurchaseRequest, Quote, Run, Step, Vendor } from './types';
 
@@ -8,6 +9,8 @@ const MAX_ACTIVE_RUNS = 3;
 const STALE_MS = 10 * 60 * 1000;
 const MAX_TOKENS = Number(process.env.VULTR_MAX_TOKENS ?? 8000);
 const QUOTE_WINDOW_HOURS = Number(process.env.QUOTE_WINDOW_HOURS ?? 48);
+const NEGOTIATION_MARGIN = Number(process.env.NEGOTIATION_MARGIN ?? 0.25); // negotiate if over budget by up to 25%
+const MAX_NEGOTIATION_ROUNDS = 2;
 const MANAGER_EMAIL = 'procurement-manager@acme.example';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -48,8 +51,11 @@ async function chat(purpose: string, system: string, user: string): Promise<stri
   }
   const ms = Date.now() - t0;
   await mutate((db) => {
-    db.traces.unshift({ id: uid('tr'), ts: new Date().toISOString(), purpose, model, ms, ok: !!text, tokens });
-    if (db.traces.length > 100) db.traces.length = 100;
+    const prevHash = db.traces[0]?.hash ?? GENESIS_HASH; // traces are newest-first, so index 0 is the most recent link
+    const record = { id: uid('tr'), ts: new Date().toISOString(), purpose, model, ms, ok: !!text, tokens };
+    const hash = nextHash(prevHash, record);
+    db.traces.unshift({ ...record, prevHash, hash });
+    if (db.traces.length > 300) db.traces.length = 300; // ledger keeps more history than the UI shows
   }).catch(() => {});
   return text;
 }
@@ -336,7 +342,7 @@ async function runSourcing(runId: string) {
     await mutate((db) => {
       for (const v of shortlist) {
         const token = randomBytes(12).toString('hex');
-        db.rfqs.unshift({ id: uid('rfq'), token, requestId: req.id, runId, vendorId: v.id, vendorName: v.name, vendorEmail: v.email, status: 'sent', deadline, createdAt: new Date().toISOString() });
+        db.rfqs.unshift({ id: uid('rfq'), token, requestId: req.id, runId, vendorId: v.id, vendorName: v.name, vendorEmail: v.email, status: 'sent', round: 1, offers: [], deadline, createdAt: new Date().toISOString() });
         const personal = rfqBody.includes('{{VENDOR}}') ? rfqBody.split('{{VENDOR}}').join(v.name) : `Hello ${v.name},\n\n${rfqBody}`;
         const body = `${personal}\n\nSubmit your quote securely here: {{BASE}}/quote/${token}\nThe quote window closes ${deadline.slice(0, 16).replace('T', ' ')} UTC.`;
         addEmail(db, { to: v.email, subject: `RFQ ${req.id}: ${req.qty} × ${req.item}`, body, kind: 'rfq', relatedId: req.id, generatedBy: rfqRaw ? 'llm' : 'template' });
@@ -412,7 +418,8 @@ export async function vendorPortalInfo(token: string) {
   if (!rfq) return null;
   const req = db.requests.find((r) => r.id === rfq.requestId);
   const run = db.runs.find((r) => r.id === rfq.runId);
-  // Deliberately omits budget and other vendors' quotes.
+  const lastAgentOffer = [...rfq.offers].reverse().find((o) => o.by === 'agent');
+  // Deliberately omits budget and other vendors' quotes; the counter message is wording only, never a number from the LLM.
   return {
     vendorName: rfq.vendorName,
     item: req?.item ?? '',
@@ -420,33 +427,96 @@ export async function vendorPortalInfo(token: string) {
     neededBy: req?.neededBy ?? '',
     deadline: rfq.deadline,
     status: rfq.status,
-    open: rfq.status === 'sent' && run?.status === 'waiting_quotes',
+    round: rfq.round,
+    open: (rfq.status === 'sent' || rfq.status === 'negotiating') && run?.status === 'waiting_quotes',
+    counterMessage: rfq.status === 'negotiating' ? lastAgentOffer?.message : undefined,
+    offers: rfq.offers,
     quote: rfq.quote ? { unitPrice: rfq.quote.unitPrice, leadDays: rfq.quote.leadDays } : undefined,
   };
 }
 
+/**
+ * Vendor submits a price. If it's over budget but close (within NEGOTIATION_MARGIN) and this is
+ * their first offer, the agent counters automatically instead of escalating straight to a human.
+ * All money math (over-budget %, the negotiation trigger) is deterministic; the LLM only writes
+ * the wording vendors see, never a number.
+ */
 export async function submitVendorQuote(token: string, unitPrice: number, leadDays: number, notes: string) {
   if (!(unitPrice > 0) || unitPrice > 10_000_000) throw new Error('Unit price must be a positive number');
   if (!Number.isInteger(leadDays) || leadDays < 0 || leadDays > 365) throw new Error('Lead time must be 0-365 days');
-  const res = await mutate((db) => {
+
+  const phase1 = await mutate((db) => {
     const rfq = db.rfqs.find((r) => r.token === token);
     if (!rfq) throw new Error('This quote link is not valid');
     const run = db.runs.find((r) => r.id === rfq.runId);
     if (!run || run.status !== 'waiting_quotes') throw new Error('The quote window for this request is closed');
-    if (rfq.status !== 'sent') throw new Error('A quote was already submitted for this request');
+    if (rfq.status !== 'sent' && rfq.status !== 'negotiating') throw new Error('A quote was already finalised for this vendor');
+    const req = db.requests.find((r) => r.id === rfq.requestId);
+    if (!req) throw new Error('Request not found');
+
     const now = new Date().toISOString();
-    // Vendor-supplied notes are stored for humans only; they never enter an LLM prompt.
+    const wasNegotiating = rfq.status === 'negotiating';
+    rfq.offers.push({ round: rfq.round, by: 'vendor', unitPrice, leadDays, message: notes.slice(0, 300) || '(no message)', llm: false, ts: now });
     rfq.quote = { unitPrice, leadDays, notes: notes.slice(0, 300), submittedAt: now };
-    rfq.status = 'quoted';
-    const all = db.rfqs.filter((r) => r.runId === rfq.runId);
-    const got = all.filter((r) => r.quote).length;
-    const s = run.steps.find((x) => x.key === 'quotes');
-    if (s) s.detail = `Waiting for vendor quotes: ${got}/${all.length} received. Latest: ${rfq.vendorName}.`;
-    run.updatedAt = now;
-    log(db, 'action', `${rfq.vendorName} submitted a quote via the vendor portal (${money(unitPrice)}/unit, ${leadDays}d lead time)`);
-    return { runId: rfq.runId, complete: got === all.length };
+
+    const total = unitPrice * req.qty;
+    const overBy = (total - req.budget) / req.budget;
+    const canNegotiate = !wasNegotiating && rfq.round < MAX_NEGOTIATION_ROUNDS && overBy > 0 && overBy <= NEGOTIATION_MARGIN;
+
+    if (canNegotiate) {
+      rfq.status = 'negotiating';
+      log(db, 'action', `${rfq.vendorName} quoted ${money(total)} (${Math.round(overBy * 100)}% over budget): agent is countering automatically`);
+    } else {
+      rfq.status = 'quoted';
+      const all = db.rfqs.filter((r) => r.runId === rfq.runId);
+      const got = all.filter((r) => r.status === 'quoted' || r.status === 'simulated').length;
+      const stepDetail = run.steps.find((x) => x.key === 'quotes');
+      if (stepDetail) stepDetail.detail = `Waiting for vendor quotes: ${got}/${all.length} finalised. Latest: ${rfq.vendorName}.`;
+      run.updatedAt = now;
+      log(db, 'action', `${rfq.vendorName}${wasNegotiating ? ' accepted the counter and' : ''} finalised a quote via the vendor portal (${money(unitPrice)}/unit, ${leadDays}d lead time)`);
+    }
+    return { negotiate: canNegotiate, runId: rfq.runId, rfqId: rfq.id, vendorName: rfq.vendorName, vendorEmail: rfq.vendorEmail, item: req.item, qty: req.qty, requestId: req.id, total, overBy };
   });
-  if (res.complete) await closeQuotes(res.runId).catch(() => {});
+
+  if (!phase1.negotiate) {
+    const db = await snapshot();
+    const all = db.rfqs.filter((r) => r.runId === phase1.runId);
+    if (all.length && all.every((r) => r.status === 'quoted' || r.status === 'simulated')) {
+      await closeQuotes(phase1.runId).catch(() => {});
+    }
+    return;
+  }
+
+  // Draft and send the counter-offer outside the store lock (the LLM call can take seconds).
+  const raw = await chat(
+    'sourcing:negotiate',
+    'You write brief, firm-but-friendly procurement negotiation messages. Output only the message body (max 70 words), no numbers beyond what is given, no subject line, sign off "Acme Procurement Team".',
+    `Vendor ${phase1.vendorName} quoted ${money(phase1.total)} total for ${phase1.qty} x ${phase1.item}, about ${Math.round(phase1.overBy * 100)}% over our budget. Ask if they can get closer to our budget, mention we are comparing competitive quotes, and ask for their best and final offer.`,
+  );
+  const message =
+    raw ??
+    `Thanks for the quote on ${phase1.qty} × ${phase1.item}. It's about ${Math.round(phase1.overBy * 100)}% above our budget and we're comparing competitive offers. Could you share your best and final price? We'd like to move forward quickly.`;
+
+  await mutate((db) => {
+    const rfq = db.rfqs.find((r) => r.id === phase1.rfqId);
+    if (!rfq) return;
+    const now = new Date().toISOString();
+    rfq.offers.push({ round: rfq.round, by: 'agent', message, llm: !!raw, ts: now });
+    rfq.round += 1;
+    addEmail(db, {
+      to: phase1.vendorEmail,
+      subject: `Re: RFQ ${phase1.requestId} — following up`,
+      body: `Hello ${phase1.vendorName},\n\n${message}\n\nReply via your quote portal link.`,
+      kind: 'followup',
+      relatedId: phase1.requestId,
+      generatedBy: raw ? 'llm' : 'template',
+    });
+    const run = db.runs.find((r) => r.id === rfq.runId);
+    const s = run?.steps.find((x) => x.key === 'quotes');
+    if (s) s.detail = `Negotiating with ${rfq.vendorName}: countered a quote ${Math.round(phase1.overBy * 100)}% over budget, awaiting their best and final offer.`;
+    if (run) run.updatedAt = now;
+    log(db, 'action', `Agent countered ${rfq.vendorName}'s quote (${Math.round(phase1.overBy * 100)}% over budget) and asked for a best-and-final offer`);
+  });
 }
 
 /* ------------------------------ sourcing phase 2: quotes → PO ------------------------------ */

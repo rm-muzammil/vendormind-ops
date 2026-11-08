@@ -17,11 +17,14 @@ of every decision that moves real money.
 | **Procurement copilot** | Ask questions about live requests, orders and vendors; answers come only from workspace data. |
 | **AI audit trail** | Every Vultr Serverless Inference call is logged with purpose, the model that actually answered, latency, tokens and outcome. |
 | **Business impact** | Dashboard shows spend and savings versus market baseline. |
+| **Autonomous negotiation** | If the best quote is over budget but close (within 25%), the agent counters automatically instead of escalating. The vendor gets one best-and-final round via their portal link. Only after that does it fall back to human approval. All thresholds and the over-budget % are computed deterministically; the LLM only writes the wording the vendor sees. |
+| **Tamper-evident decision ledger** | Every inference call is hash-chained (`sha256(prevHash + record)`), like a minimal blockchain. The **AI audit** tab recomputes and verifies the whole chain live; editing one historic record anywhere breaks verification and names the broken record. Judges can watch this fail live by corrupting `data/db.json` on the server (see Demo). |
 
 ## Agent workflows
 
-**Sourcing:** analyze need → shortlist approved vendors → draft and send RFQs → **collect vendor quotes (waits)** →
-score and recommend → policy and anomaly checks → approval routing → issue PO.
+**Sourcing:** analyze need → shortlist approved vendors → draft and send RFQs → **collect vendor quotes (waits,
+and negotiates automatically on near-miss quotes)** → score and recommend → policy and anomaly checks →
+approval routing → issue PO.
 
 **Delay follow-up:** scan open orders → draft vendor follow-ups → send → escalate orders 7+ days late with an alternate-vendor suggestion.
 
@@ -50,12 +53,17 @@ labels the output `TEMPLATE` instead of `VULTR LLM`.
 
 ## Run the demo (5 minutes)
 
-1. **Chairs (REQ-201):** Run agent. The agent writes RFQs and **waits for vendors**. Click *open vendor portal* on one vendor and submit a quote as that vendor. Click **Simulate vendor replies** for the rest. The order is under the limit with no flags, so it is auto-approved and a PO is issued.
+1. **Chairs (REQ-201):** Run agent. The agent writes RFQs and **waits for vendors**. Click *open vendor portal* on one vendor and submit a quote **about 10-15% over the request's budget** — watch it flip to "negotiating" and send a counter automatically. Submit a lower best-and-final offer on the same link to finish that vendor, then **Simulate vendor replies** for the rest.
 2. **Laptops (REQ-202):** Run agent and simulate replies. The total exceeds the limit, so it lands in **Approvals** with a quote comparison. Approve and the PO is issued.
 3. **Plain English:** type *"20 monitors by next month, budget $7k"* and watch the request appear.
 4. Turn **Autopilot ON**: within about a minute the agent chases PO-1001 (4 days late) and escalates PO-1002 (9 days late) with an alternate-vendor suggestion. Or use *Scan delays* in the Orders tab.
 5. Ask the **copilot**: *"Which orders are late and what should I do?"*
-6. Open **AI audit** to see every model call, then **Outbox** for every email written.
+6. Open **AI audit**: a green banner confirms the decision ledger is hash-chained and intact. To prove it isn't just a claim, on the server run:
+   ```bash
+   python3 -c "import json; d=json.load(open('data/db.json')); d['traces'][0]['purpose']='TAMPERED'; json.dump(d, open('data/db.json','w'))"
+   ```
+   Refresh the tab (or wait 15s) and the banner turns red, naming the exact record that was altered.
+7. **Outbox** for every email the agents wrote, including the negotiation counter.
 
 ## Setup
 
